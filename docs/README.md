@@ -1,10 +1,9 @@
-# testsignalleuchte
+signal_light
 
-Kurze Beschreibung Projekt
+Brief Project Description
+Installation
 
-## Installation
+Use the following command to install the project:
 
-Verwende den folgenden Befehl, um das Projekt zu installieren:
 
-```bash
 pip install -r requirements.txt
