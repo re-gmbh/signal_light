@@ -1,0 +1,195 @@
+from flask import Flask, request, jsonify
+import serial, requests, time
+from threading import Thread
+from requests.auth import HTTPBasicAuth
+
+app = Flask(__name__)
+
+client_id = "xwa5VCvR70lokQ5fTFS8cm6jmsTo9wIZSHugDeYsCfo"
+client_secret = "q1bu0Yd8hQoZkyqSNsySvOQxHPXqtqTwwYG6nFTM_Xs"
+
+# Konfigurationsvariablen
+port = "/dev/ttyS0"
+baudrate = 9600
+bytesize = serial.EIGHTBITS
+parity = serial.PARITY_NONE
+stopbits = serial.STOPBITS_ONE
+timeout = 1
+
+# globale variablen
+last_sent_command = None
+counter = 0
+
+# URL der GraphQL-API
+url = 'http://chub-dev/api/v1'
+
+
+headers = {
+    "Content-Type": "application/json"
+}
+
+# GraphQL-Abfrage
+asset_status_query = """
+{
+    assets(identifier: "sheet1") {
+        identifier
+        status {status}
+    }
+}
+"""
+
+
+# Zuordnung der Befehle
+commands_map = {
+    "production": "set=1,on",
+    "setup": "set=2,on",
+    "idle": "set=3,on",
+    "production_off": "set=1,off",
+    "setup_off": "set=2,off",
+    "idle_off": "set=3,off",
+}
+
+
+# Serielle Schnittstelle initialisieren
+try:
+    ser = serial.Serial(port, baudrate, bytesize=bytesize, parity=parity, stopbits=stopbits, timeout=timeout)
+    if not ser.isOpen():
+        print("Konnte keine Verbindung öffnen.")
+        exit()
+    else:
+        print("Verbindung erfolgreich geöffnet.")
+except serial.SerialException as e:
+    print(f"Fehler beim Öffnen der seriellen Schnittstelle: {str(e)}")
+    exit()
+
+# Abfrage der Api
+def query_graphql():
+    try:
+        response = requests.post(url, json={'query': asset_status_query}, headers=headers, auth=HTTPBasicAuth(client_id, client_secret))
+        if response.status_code == 200:
+            try:
+                response_data = response.json()
+                status_value = response_data['data']['assets'][0]['status']['status']
+                return status_value
+            except KeyError as e:
+                print(f"Fehler beim Extrahieren der Daten: {str(e)}, Antwort war: {response.text}")
+                return None
+        else:
+            print(f"Fehler: {response.status_code}, Nachricht: {response.text}")
+            return None
+
+    except requests.RequestException as e:
+        print(f"Fehler bei der Anfrage an die API: {str(e)}")
+        return None
+
+
+# Senden des Befehls an serielle Schnitstelle
+def send_serial_command(command):
+    try:
+        # Nachricht an serielle Schnittstelle
+        full_cmd = command + "\r\n"
+        ser.write(full_cmd.encode())
+        print(f"Befehl '{command}' gesendet.")
+
+        # Antwort
+        response = ser.readline().decode().strip()
+
+        if response:
+            print(f"Erhaltene Antwort: {response}")
+            return response
+        else:
+            print("Keine Antwort erhalten")
+    except Exception as e:
+        print(f"Fehler beim Senden des Befehls: {str(e)}")
+
+
+# Abfrage status überprüfung ist zustand und ggf. reset
+def process_status_response(asset_status):
+    global last_sent_command
+    response = send_serial_command('status')
+    status_code = response[7:12]
+
+    expected_status = None
+    if asset_status == "production":
+        expected_status = "1,0,0"
+    elif asset_status == "setup":
+        expected_status = "0,1,0"
+    elif asset_status == "idle":
+        expected_status = "0,0,1"
+
+    if status_code == expected_status:
+        print(f"Statuscode {status_code} stimmt mit dem erwarteten Wert {expected_status} überein.")
+    else:
+        print(f"Fehlerhafter Statuscode in Antwort: {status_code}. Erwartet wurde: {expected_status}.")
+        # Alle Lampen ausschalten
+        send_serial_command("set_all=0,0,0,")
+        print("Alle Lampen wurden ausgeschaltet.")
+        # variable zurücksetzen
+        last_sent_command = None
+        print(f"Aktualisierter last_sent_command zu: {last_sent_command}")
+
+
+#
+def send_command_route():
+    global last_sent_command
+    global counter
+    data = query_graphql()
+    asset_status = data
+    print(f"{asset_status} get from line")
+    print(f"{last_sent_command} letzer befehl")
+
+
+    if asset_status != last_sent_command and last_sent_command == None: # status überprüfung und neu setzen von zustand
+        process_status_response(asset_status)
+        command_to_send = commands_map.get(asset_status)
+        print(f"{command_to_send} sent")
+        last_sent_command =asset_status
+        response = send_serial_command(command_to_send)
+        if response != "OK":
+            process_status_response(asset_status)
+    elif asset_status != last_sent_command:                         # Normalfall bei Änderung alter Befehl aus neuer ein
+        off_command = commands_map.get(f"{last_sent_command}_off")
+        print(f"{off_command} Ausschaltbefehl")
+        if off_command:
+            response = send_serial_command(off_command)
+            if response != "OK":
+                print("Fehler aufgetaucht ")
+                process_status_response(asset_status)               # Fehlerbehebung durch reset etc.
+
+        command_to_send = commands_map.get(asset_status)
+        print(f"{command_to_send} sent")
+        last_sent_command =asset_status
+        response = send_serial_command(command_to_send)
+        if response != "OK":
+            process_status_response(asset_status)
+    elif asset_status == last_sent_command and counter < 5:         # Normalzustand bei keiner änderung
+        print("Keine Änderung")
+        counter = counter+1
+        print(counter)
+    elif asset_status == last_sent_command and counter == 5:        # regelmäßige Überprüfung der Korrektheit
+        process_status_response(asset_status)
+        counter = 0
+        print(counter)
+    else:
+        process_status_response(asset_status)                      # Für alle anderen möglichen Fälle Auslesen Zustand ggf. Reset und neu setzen Status
+        command_to_send = commands_map.get(asset_status)
+        print(f"{command_to_send} sent")
+        last_sent_command =asset_status
+        response = send_serial_command(command_to_send)
+        if response != "OK":
+            process_status_response(asset_status)
+
+# Hintergrund-Thread zur regelmäßigen Abfrage der API
+def background_thread():
+    while True:
+        send_command_route()
+        time.sleep(2)
+
+
+# Starten des Hintergrund-Threads
+thread = Thread(target=background_thread)
+thread.start()
+
+
+if __name__ == '__main__':
+    app.run(host='192.168.1.22', port=5000, debug=True)
